@@ -1,5 +1,5 @@
 """Utility objects and functions"""
-import hashlib
+
 import os
 import tempfile
 import json
@@ -7,41 +7,47 @@ import re
 import sys
 import shutil
 import copy
+import logging
 import stat
 import os.path as op
 from pathlib import Path
 from collections import namedtuple
 from glob import glob
 
-import logging
-lgr = logging.getLogger(__name__)
-
-
 seqinfo_fields = [
     'total_files_till_now',  # 0
     'example_dcm_file',      # 1
     'series_id',             # 2
     'dcm_dir_name',          # 3
-    'unspecified2',          # 4
-    'unspecified3',          # 5
+    'manufacturer',          # 4
+    'model',          # 5
     'dim1', 'dim2', 'dim3', 'dim4', # 6, 7, 8, 9
-    'TR', 'TE',              # 10, 11
-    'protocol_name',         # 12
-    'is_motion_corrected',   # 13
-    'is_derived',            # 14
-    'patient_id',            # 15
-    'study_description',     # 16
-    'referring_physician_name', # 17
-    'series_description',    # 18
-    'sequence_name',         # 19
-    'image_type',            # 20
-    'accession_number',      # 21
-    'patient_age',           # 22
-    'patient_sex',           # 23
-    'date',                  # 24
-    'series_uid'             # 25
- ]
-
+    'TR', 'TE', 'TI',              # 10, 11, 12
+    'protocol_name',         # 13
+    'is_motion_corrected',   # 14
+    'is_derived',            # 15
+    'patient_id',            # 16
+    'study_description',     # 17
+    'referring_physician_name', # 18
+    'series_description',    # 19
+    'sequence_name',         # 20
+    'image_type',            # 21
+    'accession_number',      # 22
+    'patient_age',           # 23
+    'patient_sex',           # 24
+    'date',                  # 25
+    'scanning_sequence',     # 27
+    'sequence_variant',      # 28
+    'scan_options',          # 29
+    'echo_number',           # 30
+    'SOPInstanceUID',        # 31
+    'SeriesInstanceUID',     # 32
+    'StudyInstanceUID',      # 33
+    'studytime',             # 34
+    'seriestime',            # 35
+    'acquisitiontime',       # 36
+    'contenttime'           # 37
+]
 SeqInfo = namedtuple('SeqInfo', seqinfo_fields)
 
 StudySessionInfo = namedtuple(
@@ -111,7 +117,7 @@ def anonymize_sid(sid, anon_sid_cmd):
 def create_file_if_missing(filename, content):
     """Create file if missing, so we do not
     override any possibly introduced changes"""
-    if op.lexists(filename):
+    if op.exists(filename):
         return False
     dirname = op.dirname(filename)
     if not op.exists(dirname):
@@ -120,6 +126,28 @@ def create_file_if_missing(filename, content):
         f.write(content)
     return True
 
+
+def mark_sensitive(ds, path_glob=None):
+    """
+
+    Parameters
+    ----------
+    ds : Dataset to operate on
+    path_glob : str, optional
+      glob of the paths within dataset to work on
+    Returns
+    -------
+    None
+    """
+    sens_kwargs = dict(
+        init=[('distribution-restrictions', 'sensitive')]
+    )
+    if path_glob:
+        paths = glob(op.join(ds.path, path_glob))
+        if not paths:
+            return
+        sens_kwargs['path'] = paths
+    ds.metadata(recursive=True, **sens_kwargs)
 
 def read_config(infile):
     with open(infile, 'rt') as fp:
@@ -165,12 +193,6 @@ def load_json(filename):
     return data
 
 
-def assure_no_file_exists(path):
-    """Check if file or symlink (git-annex?) exists, and if so -- remove"""
-    if os.path.lexists(path):
-        os.unlink(path)
-
-
 def save_json(filename, data, indent=4):
     """Save data to a json file
 
@@ -182,7 +204,6 @@ def save_json(filename, data, indent=4):
         Dictionary to save in json file.
 
     """
-    assure_no_file_exists(filename)
     with open(filename, 'w') as fp:
         fp.write(_canonical_dumps(data, sort_keys=True, indent=indent))
 
@@ -201,20 +222,12 @@ def json_dumps_pretty(j, indent=2, sort_keys=True):
     # uniform no spaces before ]
     js_ = re.sub(" *\]", "]", js_)
     # uniform spacing before numbers
-    js_ = re.sub('  *("?[-+.0-9e]+"?)(?P<space> ?)[ \n]*',
-                 r' \1\g<space>', js_)
+    js_ = re.sub('  *("?[-+.0-9e]+"?)[ \n]*', r' \1', js_)
     # no spaces after [
     js_ = re.sub('\[ ', '[', js_)
-    # the load from the original dump and reload from tuned up
-    # version should result in identical values since no value
-    # must be changed, just formatting.
-    j_just_reloaded = json.loads(js)
-    j_tuned = json.loads(js_)
-
-    assert j_just_reloaded == j_tuned, \
-       "Values differed when they should have not. "\
-       "Report to the heudiconv developers"
-
+    j_ = json.loads(js_)
+    # Removed assert as it does not do any floating point comparison
+    #assert(j == j_)
     return js_
 
 
@@ -254,76 +267,22 @@ def slim_down_info(j):
     return j
 
 
-def get_known_heuristic_names():
-    """Return a list of heuristic names present under heudiconv/heuristics"""
-    import heudiconv.heuristics
-    candidates = {
-        op.splitext(op.basename(x))[0]
-        for hp in heudiconv.heuristics.__path__
-        for x in glob(op.join(hp, '*.py')) + glob(op.join(hp, '*.py[co]'))
-    }
-    return sorted(
-        filter(
-            lambda c: not (c.startswith('test_') or c.startswith('_')),
-            candidates
-        )
-    )
-
-
-def load_heuristic(heuristic):
+def load_heuristic(heuristic_file):
     """Load heuristic from the file, return the module
     """
-    if os.path.sep in heuristic or os.path.lexists(heuristic):
-        heuristic_file = op.realpath(heuristic)
-        path, fname = op.split(heuristic_file)
-        try:
-            old_syspath = sys.path[:]
-            sys.path.append(path)
-            mod = __import__(fname.split('.')[0])
-            mod.filename = heuristic_file
-        finally:
-            sys.path = old_syspath
-    else:
-        from importlib import import_module
-        try:
-            mod = import_module('heudiconv.heuristics.%s' % heuristic)
-            mod.filename = mod.__file__.rstrip('co')  # remove c or o from pyc/pyo
-        except Exception as exc:
-            raise ImportError(
-                "Failed to import heuristic %s: %s"
-                % (heuristic, exc)
-            )
+    path, fname = op.split(heuristic_file)
+    sys.path.append(path)
+    mod = __import__(fname.split('.')[0])
+    mod.filename = heuristic_file
     return mod
 
 
-def get_heuristic_description(name, full=False):
-    try:
-        mod = load_heuristic(name)
-        desc = (getattr(mod, '__doc__', '') or '').strip()
-        return desc.split(os.linesep)[0] if not full else desc
-    except Exception as exc:
-        return "Failed to load: %s" % exc
-
-
-def get_known_heuristics_with_descriptions():
-    from collections import OrderedDict
-    heuristics = OrderedDict()
-    for name in get_known_heuristic_names():
-        heuristics[name] = get_heuristic_description(name, full=False)
-    return heuristics
-
-
-def safe_copyfile(src, dest, overwrite=False):
+def safe_copyfile(src, dest):
     """Copy file but blow if destination name already exists
     """
     if op.isdir(dest):
         dest = op.join(dest, op.basename(src))
     if op.lexists(dest):
-        if not overwrite:
-            raise RuntimeError(
-                "was asked to copy %s but destination already exists: %s"
-                % (src, dest)
-            )
         os.unlink(dest)
     shutil.copyfile(src, dest)
 
@@ -384,68 +343,3 @@ def clear_temp_dicoms(item_dicoms):
         and op.exists(str(tmp))):
         # clean up directory holding dicoms
         shutil.rmtree(str(tmp))
-
-
-def file_md5sum(filename):
-    with open(filename, 'rb') as f:
-        return hashlib.md5(f.read()).hexdigest()
-
-
-# Borrowed from DataLad (MIT license), with "archives" functionality commented
-# out
-class File(object):
-    """Helper for a file entry in the create_tree/@with_tree
-
-    It allows to define additional settings for entries
-    """
-    def __init__(self, name, executable=False):
-        """
-
-        Parameters
-        ----------
-        name : str
-          Name of the file
-        executable: bool, optional
-          Make it executable
-        """
-        self.name = name
-        self.executable = executable
-
-    def __str__(self):
-        return self.name
-
-
-def create_tree(path, tree, archives_leading_dir=True):
-    """Given a list of tuples (name, load) or a dict create such a tree
-
-    if load is a tuple or a dict itself -- that would create either a subtree
-    or an archive with that content and place it into the tree if name ends
-    with .tar.gz
-    """
-    lgr.log(5, "Creating a tree under %s", path)
-    if not op.exists(path):
-        os.makedirs(path)
-
-    if isinstance(tree, dict):
-        tree = tree.items()
-
-    for file_, load in tree:
-        if isinstance(file_, File):
-            executable = file_.executable
-            name = file_.name
-        else:
-            executable = False
-            name = file_
-        full_name = op.join(path, name)
-        if isinstance(load, (tuple, list, dict)):
-            # if name.endswith('.tar.gz') or name.endswith('.tar') or name.endswith('.zip'):
-            #     create_tree_archive(path, name, load, archives_leading_dir=archives_leading_dir)
-            # else:
-            create_tree(full_name, load, archives_leading_dir=archives_leading_dir)
-        else:
-            with open(full_name, 'w') as f:
-                if sys.version_info[0] == 2 and not isinstance(load, str):
-                    load = load.encode('utf-8')
-                f.write(load)
-        if executable:
-            os.chmod(full_name, os.stat(full_name).st_mode | stat.S_IEXEC)
